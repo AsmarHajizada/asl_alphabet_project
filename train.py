@@ -1,110 +1,114 @@
 import torch
-import torch.nn as nn 
+import torch.nn as nn
 from torch.nn.functional import softmax
+from torch.nn.functional import cross_entropy
+from torch.utils.data import DataLoader
+from torchmetrics import F1Score
+from torchmetrics.classification import MulticlassAccuracy
 
-from torch.utils.data import DataLoader, Dataset 
-from model.model import Model
+
+from model.vgg import vgg16
+from model.resnet import ResNetModel
 from dataset.dataset_retrieval import custom_dataset
-from torch.optim import SGD
-
+from torch.optim import SGD, Adam
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from utils import metrics
 
 import os
 
 save_model_path = "checkpoints/"
-pth_name = "saved_model.pth"
+pth_name = "VGGAdam.pth" # change this to the name of the model you want to save
+
+
 
 
 def val(model, data_val, loss_function, writer, epoch):
-    
 
-    f1_score = 0
-    
-    data_iterator = enumerate(data_val)     #take batches
+    f1 = F1Score(num_classes=29, task = 'multiclass', average='macro')
+    accuracy = MulticlassAccuracy(num_classes=29)
+    data_iterator = enumerate(data_val)  # take batches
+    accuracy_list = []
+    accuracyt_list = []
+    f1_list = []
+    f1t_list = []
+
     with torch.no_grad():
-
-        model.eval()    #switch model to evaluation mode
+        model.eval()  # switch model to evaluation mode
         tq = tqdm(total=len(data_val))
-        tq.set_description('Validation:')
-        
+        tq.set_description('Validation')
+
         total_loss = 0
 
         for _, batch in data_iterator:
-            #forward propagation
+            # forward propagation
             image, label = batch
-            pred = model(image.cuda())
-            
-            loss = loss_function(pred.cuda(), label.cuda())
+            image = image.cuda()
+            label = label.cuda()
+            pred = model(image)
+        
+            loss = loss_function(pred, label)
+            loss = loss.cuda()
 
-            pred = pred.softmax(dim=1)
-            f1_score += metrics(pred, label.cuda())
+            f1_list.extend(torch.argmax(pred, dim =1).tolist())
+            f1t_list.extend(torch.argmax(label, dim =1).tolist())
+
+            accuracy_list.extend(torch.argmax(pred, dim =1).tolist())
+            accuracyt_list.extend(torch.argmax(label, dim =1).tolist())
 
             total_loss += loss.item()
             tq.update(1)
 
-
-
-    
-    writer.add_scalar("Validation mIoU", f1_score/len(data_val), epoch)
-    writer.add_scalar("Validation Loss", total_loss/len(data_val), epoch)
-    
-    print("F1 score: ", f1_score/len(data_val))
-
     tq.close()
+    print("F1 score: ", f1(torch.tensor(f1_list), torch.tensor(f1t_list)))
+    print("Accuracy: ", accuracy(torch.tensor(accuracy_list), torch.tensor(accuracyt_list)))
 
+    writer.add_scalar("Validation mIoU", f1(torch.tensor(f1_list), torch.tensor(f1t_list)), epoch)
+    writer.add_scalar("Validation Loss", total_loss/len(data_val), epoch)
 
     return None
 
 
-
-
-def train (model, train_data, val_data,  optimizer, loss, max_epoch):
-
+def train(model, dataloader, val_loader, optimizer, loss_fn, n_epochs):
+    device = 'cuda'
     writer = SummaryWriter()
-    for epoch in range(max_epoch):
-        
-        model.train() # if you are going to update your model, put it in train mode.
-        
-        f1_score = 0 # to find total performance per epoch
-        loss_total = 0
 
-        data_iterator = enumerate(train_data)
-
-        #tqdm is library to see he progressbar
-        tq = tqdm(total=len(train_data)) 
+    model.cuda()  # Move the model to the specified device (e.g., GPU or CPU)
+    model.train()  # Set the model to training mode
+    for epoch in range(n_epochs):
+        running_loss = 0.0
+        tq = tqdm(total=len(dataloader))
         tq.set_description('epoch %d' % (epoch))
 
-        for it, batch in data_iterator:
-            optimizer.zero_grad()
 
+        for i, (images, labels) in enumerate(dataloader):
+            images = images.to(device)  # Move the batch of images to the specified device
+            labels = labels.to(device)  # Move the batch of labels to the specified device
+            
+            optimizer.zero_grad()  # Reset the gradients of the optimizer
+            
+            # Forward pass
+            outputs = model(images)
+            
+            # Compute loss
+            loss = loss_fn(outputs, labels)
+            outputs = outputs.softmax(dim=1)
 
-            images, labels = batch
+            # Backward pass
+            loss.backward()
 
-            pred = model(images.cuda())
-            pred = softmax(pred, dim = 1)
-
-            loss_value  =  loss(pred, labels.cuda())
-            f1_score += metrics(pred, labels.cuda())
-
-            loss_value.backward()
-            optimizer.step(())
-
-            loss_total +=loss_value.item() #pay attention!! if you dont write .item() you will overload gpu
-
-
-            tq.set_postfix(loss_st='%.6f' % loss_value)
+            # Update model parameters
+            optimizer.step()
+            
+            running_loss += loss.item()
+            tq.set_postfix(loss_st='%.6f' % loss.item())
             tq.update(1)
-
-        writer.add_scalar("Training F1", f1_score/len(train_data), epoch)
-        writer.add_scalar("Validation Loss", loss_total/len(val_data), epoch)
             
         tq.close()
 
-        val(model, val_data, loss, writer, epoch)
+        epoch_loss = running_loss / len(dataloader)
+        print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch+1, n_epochs, epoch_loss))
 
-
+        val(model, val_loader, loss_fn, writer, epoch)
 
         checkpoint = {
             'epoch': epoch + 1,
@@ -114,46 +118,31 @@ def train (model, train_data, val_data,  optimizer, loss, max_epoch):
 
         torch.save(checkpoint, os.path.join(save_model_path, pth_name))
         print("saved the model " + save_model_path)
+        model.train()
+
+if __name__ == '__main__':
+    train_data = custom_dataset("train")
+    val_data = custom_dataset("val")
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=8,
+        shuffle=True,
+        num_workers=4
+    )
+
+    val_loader = DataLoader(
+        val_data,
+        batch_size=1,
+        num_workers=4
+    )
+
+    model = ResNetModel(29).cuda()   
+    model2 = vgg16(29).cuda()
+    optimizer1 = SGD(model2.parameters(),  lr=0.002)  # change model and learning rate 
+    optimizer2 = Adam(model2.parameters(), lr=0.0005) # change model and learning rate
+    loss = nn.CrossEntropyLoss()
 
 
-            
-
-
-train_data = custom_dataset("train")
-test_data = custom_dataset("test")
-
-train_loader = DataLoader(
-    train_data,
-    batch_size=2,
-    shuffle=True
-)
-
-iterator = enumerate(train_loader)
-
-_, batch = next(iterator)
-image, label = batch
-
-test_loader = DataLoader(
-    test_data,
-    batch_size = 1
-)
-
-model = Model(28).cuda()
-
-optimizer = SGD(model.parameters(),  lr = 0.001)
-
-loss = nn.CrossEntropyLoss()
-
-train(model, train_data, test_data,  optimizer, loss, max_epoch=10)
-
-# print(model.forward(torch.randn(1, 3, 256, 256)))
-
-
-print(custom_dataset().unique_labels)
-
-
-# if you want to load your pretrained model or
-# you want to resume stopped training
-# use torch.load_state_dict by checking the library!
-
-
+    train(model2, train_loader, val_loader, optimizer2, loss, 15) # change model, optimizer and epoch number 
+    print('Finished Training: VGG16 Adam (lr=0.0001)') # change this to the name and parameters of the model you want to train
